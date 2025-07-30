@@ -30,7 +30,7 @@ def train_tokenizer_bpe(
     # Preprocess text
     pre_token_cnt = preprocess_test(text,special_tokens)
 
-    total_merge = vocab_size - len(vocab)
+    total_merges = vocab_size - len(vocab)
     pbar = tqdm(total=total_merges, desc="Training BPE tokenizer")
 
     while len(vocab) < vocab_size:
@@ -73,7 +73,8 @@ def train_tokenizer_bpe(
                     new_word.append(word[i])
             new_pre_token_cnt[tuple(new_word)] += count
         pre_token_cnt = new_pre_token_cnt
-        pbar.close()
+
+    pbar.close()
     return vocab, merges
 
 
@@ -93,8 +94,11 @@ def preprocess_test(text: str, special_tokens: list[str]) -> defaultdict[tuple[b
 
 if __name__ == "__main__":
     DATA_PATH = pathlib.Path(__file__).resolve().parent.parent / "data"
+    # INPUT_PATH = os.path.join(DATA_PATH, "owt_train.txt")
     INPUT_PATH = os.path.join(DATA_PATH, "TinyStoriesV2-GPT4-train.txt")
     TOKENIZER_DIR = pathlib.Path(__file__).resolve().parent.parent/ "tokenizer"
+    # VOCAB_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_vocab.pkl")
+    # MERGES_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_merges.pkl")
     VOCAB_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_vocab.pkl")
     MERGES_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_merges.pkl")
     special_tokens = ["<|endoftext|>"]
