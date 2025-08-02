@@ -141,3 +141,35 @@ class RoPE(torch.nn.Module):
         result[...,1::2] = x2_new
         return result
 
+class Softmax(torch.nn.Module):
+    """
+    A simple Softmax layer that can be used in the model.
+    """
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+        x = x - x.max(dim=self.dim, keepdim=True)[0]
+        expx = torch.exp(x)
+        return expx / expx.sum(dim=self.dim, keepdim=True)
+    
+class Scaled_Dot_Product_Attention(torch.nn.Module):
+    """
+    A simple Scaled Dot Product Attention layer that can be used in the model.
+    """
+    def __init__(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        super().__init__()
+        self.softmax = Softmax(dim=-1)
+
+    def forward(self, 
+                query: Float[Tensor, "... queries d_k"],
+                key: Float[Tensor, "... keys d_k"],
+                value: Float[Tensor, "... values d_v"],
+                mask: Int[Tensor, "... queries keys"] | None = None
+                ) -> Float[Tensor, "... queries d_v"]:
+        attn = einsum(query, key, "... queries d_k, ... keys d_k -> ... queries keys")/math.sqrt(torch.tensor(query.shape[-1]))
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, float('-inf'))
+        attn = self.softmax(attn)
+        return einsum(attn, value, "... queries keys, ... keys d_v -> ... queries d_v")

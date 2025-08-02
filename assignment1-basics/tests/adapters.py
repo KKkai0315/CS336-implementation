@@ -19,6 +19,8 @@ from cs336_basics.model import RMSNorm
 from cs336_basics.model import SiLU
 from cs336_basics.model import SWiGLU
 from cs336_basics.model import RoPE
+from cs336_basics.model import Softmax
+from cs336_basics.model import Scaled_Dot_Product_Attention
 
 
 
@@ -121,6 +123,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+    sdpa = Scaled_Dot_Product_Attention()
+    return sdpa(Q, K, V, mask)
     raise NotImplementedError
 
 
@@ -457,6 +461,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
+    softmax = Softmax(dim=dim)
+    return softmax(in_features)
     raise NotImplementedError
 
 
