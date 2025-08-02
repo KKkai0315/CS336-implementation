@@ -1,3 +1,4 @@
+# type:ignore
 from __future__ import annotations
 
 import os
@@ -8,9 +9,16 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
+from einops import einsum, rearrange
 
 from cs336_basics.train_tokenizer import train_tokenizer_bpe
 from cs336_basics.tokenizer import BPETokenizer
+from cs336_basics.model import Linear
+from cs336_basics.model import Embedding
+from cs336_basics.model import RMSNorm
+from cs336_basics.model import SiLU
+from cs336_basics.model import SWiGLU
+from cs336_basics.model import RoPE
 
 
 
@@ -32,7 +40,7 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
+    return einsum(in_features, weights, "... d_in, d_out d_in -> ... d_out")
     raise NotImplementedError
 
 
@@ -54,7 +62,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
+    return weights[token_ids]
     raise NotImplementedError
 
 
@@ -87,6 +95,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
+    res1 = einsum(in_features, w1_weight, "... d_model, d_ff d_model -> ... d_ff")
+    res1 = run_silu(res1)
+    res2 = einsum(in_features, w3_weight, "... d_model, d_ff d_model -> ... d_ff")
+    res3 = res1 * res2
+    return einsum(res3, w2_weight, "... d_ff, d_model d_ff -> ... d_model")
     raise NotImplementedError
 
 
@@ -204,6 +217,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
+    rope = RoPE(theta=theta, d_k=d_k, seq_len=in_query_or_key.shape[-2])
+    return rope(in_query_or_key, in_query_or_key.shape[-2],token_positions)
     raise NotImplementedError
 
 
@@ -382,6 +397,11 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
+    in_dtype = in_features.dtype
+    in_features = in_features.to(torch.float32)
+    norm = torch.rsqrt(in_features.pow(2).mean(dim=-1, keepdim=True) + eps)
+    out_features = in_features * norm
+    return out_features * weights.to(in_dtype)
     raise NotImplementedError
 
 
@@ -396,6 +416,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
+    silu = SiLU()
+    return silu(in_features)
     raise NotImplementedError
 
 
