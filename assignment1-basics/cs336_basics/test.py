@@ -1,143 +1,109 @@
 import torch
 import einx
+from einops import rearrange
 
-def demonstrate_einx_get_at():
-    """演示 einx.get_at 的各种用法"""
+def compare_causal_mask_methods():
+    sequence_length = 4
+    batch_size = 2
+    num_heads = 3
+    device = torch.device('cpu')
     
-    print("=== einx.get_at 使用示例 ===\n")
+    # 模拟批次维度
+    b = [batch_size]  # 假设只有一个批次维度
     
-    # ===== 基本用法 =====
-    print("1. 基本索引操作:")
+    print("=== 方法1：原生PyTorch (第一个代码) ===")
+    seq1 = torch.arange(sequence_length)  # 注意：没有指定device
+    qi1 = seq1.view(-1, 1)  # (seq_len, 1)
+    ki1 = seq1.view(1, -1)  # (1, seq_len)
+    causal_mask1 = qi1 >= ki1  # (seq_len, seq_len)
     
-    # 创建一个简单的2D tensor
-    x = torch.tensor([[1, 2, 3, 4],
-                      [5, 6, 7, 8],
-                      [9, 10, 11, 12]])
-    print(f"原始tensor x:\n{x}")
-    print(f"形状: {x.shape}")
+    # 手动添加维度
+    for i in range(len(b) + 1):  # +1 for heads
+        causal_mask1 = causal_mask1.unsqueeze(0)
     
-    # 获取特定位置的元素
-    indices = torch.tensor([0, 2, 1])  # 要获取的行索引
-    result1 = einx.get_at("[index] features -> selected features", x, index=indices)
-    print(f"\n获取行 [0, 2, 1]:\n{result1}")
+    print(f"掩码1形状: {causal_mask1.shape}")
+    print("掩码1内容 (去除批次和头维度):")
+    print(causal_mask1.squeeze().int())
     
-    # ===== 多维索引 =====
-    print("\n2. 多维索引操作:")
+    print("\n=== 方法2：einx (第二个代码) ===")
+    seq2 = torch.arange(sequence_length, device=device)
+    qi2 = einx.rearrange('query -> b... 1 query 1', seq2, b=[1] * len(b))
+    kj2 = einx.rearrange('key   -> b... 1 1   key', seq2, b=[1] * len(b))
+    causal_mask2 = qi2 >= kj2
     
-    # 3D tensor示例
-    x_3d = torch.randn(2, 3, 4)  # (batch, seq, features)
-    print(f"3D tensor形状: {x_3d.shape}")
+    print(f"掩码2形状: {causal_mask2.shape}")
+    print("掩码2内容 (去除批次和头维度):")
+    print(causal_mask2.squeeze().int())
     
-    # 从每个batch中获取特定序列位置
-    seq_indices = torch.tensor([[0, 2], [1, 0]])  # 每个batch选择2个位置
-    result2 = einx.get_at("batch [seq_idx] features -> batch new_seq features", 
-                          x_3d, seq_idx=seq_indices)
-    print(f"选择特定序列位置后的形状: {result2.shape}")
+    print("\n=== 结果对比 ===")
+    # 为了公平比较，将mask1也移到相同设备
+    causal_mask1 = causal_mask1.to(device)
     
-    # ===== 在注意力机制中的应用 =====
-    print("\n3. 注意力机制中的top-k选择:")
+    # 调整形状使其一致（第一种方法可能需要广播到正确的形状）
+    if causal_mask1.shape != causal_mask2.shape:
+        print(f"形状不同: {causal_mask1.shape} vs {causal_mask2.shape}")
+        # 可能需要手动调整形状
     
-    # 模拟注意力分数
-    attention_scores = torch.tensor([[0.1, 0.8, 0.3, 0.9, 0.2],
-                                     [0.7, 0.1, 0.9, 0.4, 0.6]])
-    values = torch.randn(2, 5, 64)  # (batch, seq, hidden)
+    # 检查内容是否相同
+    if torch.equal(causal_mask1.squeeze(), causal_mask2.squeeze()):
+        print("✅ 两种方法生成的掩码内容相同")
+    else:
+        print("❌ 两种方法生成的掩码内容不同")
     
-    # 获取top-k注意力位置
-    k = 3
-    _, top_indices = torch.topk(attention_scores, k, dim=1)
-    print(f"Top-{k} 注意力位置: {top_indices}")
-    
-    # 使用get_at获取对应的values
-    top_values = einx.get_at("batch [seq_idx] hidden -> batch topk hidden", 
-                             values, seq_idx=top_indices)
-    print(f"Top-k values形状: {top_values.shape}")
-    
-    # ===== 词汇表索引 =====
-    print("\n4. 词汇表embedding查找:")
-    
-    # 模拟embedding表
-    vocab_size, embed_dim = 1000, 128
-    embeddings = torch.randn(vocab_size, embed_dim)
-    
-    # 输入token ids
-    token_ids = torch.tensor([[1, 15, 234, 56],
-                              [789, 2, 444, 123]])
-    
-    # 获取对应的embeddings
-    token_embeddings = einx.get_at("[vocab] embed -> batch seq embed", 
-                                   embeddings, vocab=token_ids)
-    print(f"Token embeddings形状: {token_embeddings.shape}")
-    
-    # ===== 高级用法：条件索引 =====
-    print("\n5. 条件索引 - 根据mask选择:")
-    
-    # 创建数据和mask
-    data = torch.randn(2, 6, 32)  # (batch, seq, features)
-    mask = torch.tensor([[True, False, True, True, False, True],
-                         [False, True, True, False, True, True]])
-    
-    # 获取mask为True的位置的索引
-    valid_indices = []
-    for i in range(mask.shape[0]):
-        valid_idx = torch.where(mask[i])[0]
-        valid_indices.append(valid_idx)
-    
-    # 由于每个batch的有效长度不同，我们需要处理变长序列
-    max_valid = max(len(idx) for idx in valid_indices)
-    padded_indices = torch.full((mask.shape[0], max_valid), -1, dtype=torch.long)
-    
-    for i, idx in enumerate(valid_indices):
-        padded_indices[i, :len(idx)] = idx
-    
-    print(f"有效位置索引:\n{padded_indices}")
-    
-    # 使用get_at获取有效位置的数据（注意：-1索引需要特殊处理）
-    # 在实际使用中，通常会先过滤掉-1或使用其他方法
-    
-    # ===== 比较传统索引方法 =====
-    print("\n6. 与传统索引方法对比:")
-    
-    x_compare = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    indices_compare = torch.tensor([0, 2])
-    
-    # 传统方法
-    traditional = x_compare[indices_compare]
-    print(f"传统索引结果:\n{traditional}")
-    
-    # einx方法
-    einx_result = einx.get_at("[index] features -> selected features", 
-                              x_compare, index=indices_compare)
-    print(f"einx.get_at结果:\n{einx_result}")
-    
-    print(f"结果相同: {torch.equal(traditional, einx_result)}")
+    return causal_mask1, causal_mask2
 
-
-def rope_example_with_get_at():
-    """在RoPE中使用get_at的示例"""
-    print("\n=== RoPE中使用get_at的示例 ===")
+def show_detailed_differences():
+    print("\n" + "="*60)
+    print("详细差异分析:")
+    print("="*60)
     
-    # 假设我们有预计算的cos/sin缓存
-    max_seq_len = 100
-    d_k = 64
+    differences = [
+        {
+            "方面": "设备处理",
+            "方法1": "❌ 未指定device，可能导致设备不匹配",
+            "方法2": "✅ 正确指定device=x.device"
+        },
+        {
+            "方面": "代码简洁性",
+            "方法1": "❌ 需要手动循环添加维度",
+            "方法2": "✅ 使用einx一步到位"
+        },
+        {
+            "方面": "可读性",
+            "方法1": "✅ 逻辑清晰，容易理解",
+            "方法2": "⚠️ 需要了解einx语法"
+        },
+        {
+            "方面": "性能",
+            "方法1": "✅ 原生操作，无额外依赖",
+            "方法2": "⚠️ 需要einx库，但操作更高效"
+        },
+        {
+            "方面": "维度处理",
+            "方法1": "❌ 手动处理，容易出错",
+            "方法2": "✅ 自动处理批次维度"
+        },
+        {
+            "方面": "错误风险",
+            "方法1": "❌ 容易忘记设备或维度处理",
+            "方法2": "✅ 更加安全"
+        }
+    ]
     
-    # 预计算的cos/sin表 (max_seq_len, d_k//2)
-    cos_cache = torch.randn(max_seq_len, d_k // 2)
-    sin_cache = torch.randn(max_seq_len, d_k // 2)
-    
-    # 输入token位置
-    token_positions = torch.tensor([[0, 1, 5, 10], [2, 3, 7, 8]])
-    
-    # 使用get_at根据位置获取对应的cos/sin值
-    cos_vals = einx.get_at("[pos] dim -> batch seq dim", 
-                           cos_cache, pos=token_positions)
-    sin_vals = einx.get_at("[pos] dim -> batch seq dim", 
-                           sin_cache, pos=token_positions)
-    
-    print(f"Token positions: {token_positions}")
-    print(f"Retrieved cos shape: {cos_vals.shape}")
-    print(f"Retrieved sin shape: {sin_vals.shape}")
-
+    for diff in differences:
+        print(f"\n{diff['方面']}:")
+        print(f"  方法1: {diff['方法1']}")
+        print(f"  方法2: {diff['方法2']}")
 
 if __name__ == "__main__":
-    demonstrate_einx_get_at()
-    rope_example_with_get_at()
+    compare_causal_mask_methods()
+    show_detailed_differences()
+    
+    print("\n" + "="*60)
+    print("推荐做法:")
+    print("="*60)
+    print("1. 修复第一个代码中的语法错误")
+    print("2. 添加proper设备处理")
+    print("3. 考虑使用torch.tril()作为更简洁的替代方案")
+    print("4. 确保位置编码函数调用参数一致")
+    print("5. 统一变量命名（qi/ki vs qi/kj）")

@@ -173,3 +173,95 @@ class Scaled_Dot_Product_Attention(torch.nn.Module):
             attn = attn.masked_fill(mask == 0, float('-inf'))
         attn = self.softmax(attn)
         return einsum(attn, value, "... queries keys, ... keys d_v -> ... queries d_v")
+    
+class MultiHeadAttention(torch.nn.Module):
+    """
+    A simple Multi-Head Attention layer that can be used in the model.
+    """
+    def __init__(self, 
+                 d_model: int, 
+                 num_heads: int, 
+                 theta: float = 10000.0,
+                 seq_len: int = 512,
+                 device: torch.device | None = None, 
+                 dtype: torch.dtype | None = None):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_k = d_model // num_heads
+        self.d_v = self.d_k
+        self.num_heads = num_heads
+        
+        self.q_proj = Linear(d_model, d_k * num_heads)
+        self.k_proj = Linear(d_model, d_k * num_heads)
+        self.v_proj = Linear(d_model, d_v * num_heads)
+        self.o_proj = Linear(d_v * num_heads, d_model)
+
+        self.positional_encoder = RoPE(theta=theta, d_k=self.d_k, seq_len=seq_len)
+
+        self.attention = Scaled_Dot_Product_Attention()
+
+    def forward(self, 
+                x: Float[Tensor, " ... sequence_length d_in"],
+                token_positions: Int[Tensor, " ... sequence_length"] | None = None
+                ) -> Float[Tensor, " ... sequence_length d_out"]:
+        *b, sequence_length, d_in = x.shape
+        assert d_in == self.d_model
+
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q, K, V = (
+            rearrange(X, "... seq_len (heads d_k) -> ... heads seq_len d_k", heads=self.num_heads)
+            for X in (Q, K, V)
+        )
+        if token_positions is not None:
+            token_positions = rearrange(token_positions, "... seq_len -> ... 1 seq_len")
+        else:
+            token_positions = torch.arange(sequence_length).unsqueeze(0).unsqueeze(0)
+        Q = self.positional_encoder(Q, sequence_length, token_positions)
+        K = self.positional_encoder(K, sequence_length, token_positions)
+
+        seq = torch.arange(sequence_length)
+        qi = seq.view(-1,1) #(seq_len, 1)
+        ki = seq.view(1,-1) #(1, seq_len)
+
+        causal_mask = qi >= ki #(seq_len, seq_len)
+
+        for i in range(len(b)+1):
+            causal_mask = causal_mask.unsqueeze(0)
+            
+        attn_output = self.attention(Q, K, V, causal_mask)
+        attn_output = rearrange(attn_output, "... heads seq_len d_v -> ... seq_len (heads d_v)")
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+            
+class Cross_Entropy_Loss(torch.nn.Module):
+    """
+    A simple Cross Entropy Loss layer that can be used in the model.
+    """
+    def __init__(self,
+                device: torch.device | None = None,
+                dtype: torch.dtype | None = None):
+        super().__init__()
+
+    def forward(self,
+                inputs: Float[Tensor, "... d_model"], 
+                targets: Int[Tensor, "..."])-> Float[Tensor, "..."]:
+        """
+        Computes the cross-entropy loss between the inputs and targets.
+        
+        Args:
+            inputs (Float[Tensor, "... d_model"]): The input logits.
+            targets (Int[Tensor, "..."]): The target indices.
+        
+        Returns:
+            Float[Tensor, "..."]: The average cross-entropy loss across examples.
+        """
+        log_softmax = inputs - inputs.logsumexp(dim=1, keepdim=True)  # (batch_size, 1)
+        target_log_probs = log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)  # (batch_size)
+        loss = -target_log_probs.mean()
+        return loss
+
+        
+        

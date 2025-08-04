@@ -21,6 +21,7 @@ from cs336_basics.model import SWiGLU
 from cs336_basics.model import RoPE
 from cs336_basics.model import Softmax
 from cs336_basics.model import Scaled_Dot_Product_Attention
+from cs336_basics.model import Cross_Entropy_Loss
 
 
 
@@ -159,6 +160,32 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    *b, seq_len, d_model = in_features.shape
+    d_k = d_model // num_heads
+    d_v = d_k
+    sdpa = Scaled_Dot_Product_Attention()
+
+    Q = einsum(in_features, q_proj_weight, "... sequence_length d_in, d_k d_in -> ... sequence_length d_k")
+    K = einsum(in_features, k_proj_weight, "... sequence_length d_in, d_k d_in -> ... sequence_length d_k")
+    V = einsum(in_features, v_proj_weight, "... sequence_length d_in, d_v d_in -> ... sequence_length d_v")
+
+    Q, K, V = (
+            rearrange(X, "... seq_len (heads d_k) -> ... heads seq_len d_k", heads=num_heads)
+            for X in (Q, K, V)
+        )
+
+    seq = torch.arange(seq_len)
+    qi = seq.view(-1, 1)
+    kj = seq.view(1, -1)
+    causal_mask = qi >= kj
+
+    for i in range(len(b)+1):
+        causal_mask = causal_mask.unsqueeze(0)
+
+    attn_output = sdpa(Q, K, V, causal_mask)
+    attn_output = rearrange(attn_output, "... heads seq_len d_v -> ... seq_len (heads d_v)")
+    attn_output = einsum(attn_output, o_proj_weight, "... seq_len d_v, d_model d_v -> ... seq_len d_model")
+    return attn_output
     raise NotImplementedError
 
 
@@ -199,6 +226,40 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    *b, seq_len, d_model = in_features.shape
+    d_k = d_model // num_heads
+    d_v = d_k
+    rope = RoPE(theta=theta, d_k=d_k, seq_len=seq_len)
+    sdpa = Scaled_Dot_Product_Attention()
+
+    Q = einsum(in_features, q_proj_weight, "... sequence_length d_in, d_k d_in -> ... sequence_length d_k")
+    K = einsum(in_features, k_proj_weight, "... sequence_length d_in, d_k d_in -> ... sequence_length d_k")
+    V = einsum(in_features, v_proj_weight, "... sequence_length d_in, d_v d_in -> ... sequence_length d_v")
+
+    Q, K, V = (
+            rearrange(X, "... seq_len (heads d_k) -> ... heads seq_len d_k", heads=num_heads)
+            for X in (Q, K, V)
+        )
+    
+    if token_positions is not None:
+            token_positions = rearrange(token_positions, "... seq_len -> ... 1 seq_len")
+    else:
+        token_positions = torch.arange(seq_len).unsqueeze(0).unsqueeze(0)
+    Q = rope(Q, seq_len, token_positions)
+    K = rope(K, seq_len, token_positions)
+
+    seq = torch.arange(seq_len)
+    qi = seq.view(-1, 1)
+    kj = seq.view(1, -1)
+    causal_mask = qi >= kj
+
+    for i in range(len(b)+1):
+        causal_mask = causal_mask.unsqueeze(0)
+
+    attn_output = sdpa(Q, K, V, causal_mask)
+    attn_output = rearrange(attn_output, "... heads seq_len d_v -> ... seq_len (heads d_v)")
+    attn_output = einsum(attn_output, o_proj_weight, "... seq_len d_v, d_model d_v -> ... seq_len d_model")
+    return attn_output
     raise NotImplementedError
 
 
@@ -296,6 +357,32 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
+    x = run_rmsnorm(d_model=d_model, eps=1e-5, weights=weights['ln1.weight'], in_features=in_features)
+    x = run_multihead_self_attention_with_rope(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        q_proj_weight=weights["attn.q_proj.weight"],
+        k_proj_weight=weights["attn.k_proj.weight"],
+        v_proj_weight=weights["attn.v_proj.weight"],
+        o_proj_weight=weights["attn.output_proj.weight"],
+        in_features=x,
+        token_positions=None,  
+    )
+    x = in_features + x
+    residual = x
+    x = run_rmsnorm(d_model=d_model, eps=1e-5, weights=weights["ln2.weight"], in_features=x)
+    x = run_swiglu(
+        d_model=d_model,
+        d_ff=d_ff,
+        w1_weight=weights["ffn.w1.weight"],
+        w2_weight=weights["ffn.w2.weight"],
+        w3_weight=weights["ffn.w3.weight"],
+        in_features=x,
+    )
+    output = x + residual
+    return output
     raise NotImplementedError
 
 
@@ -378,6 +465,56 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
+    batch_size, seq_len = in_indices.shape
+    assert seq_len <= context_length, "Input sequence length exceeds context length."
+
+    token_embeddings = run_embedding(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        weights=weights['token_embeddings.weight'],
+        token_ids=in_indices
+    )
+
+    for i in range(num_layers):
+        layer_weights = {
+            'attn.q_proj.weight': weights[f'layers.{i}.attn.q_proj.weight'],
+            'attn.k_proj.weight': weights[f'layers.{i}.attn.k_proj.weight'],
+            'attn.v_proj.weight': weights[f'layers.{i}.attn.v_proj.weight'],
+            'attn.output_proj.weight': weights[f'layers.{i}.attn.output_proj.weight'],
+            'ln1.weight': weights[f'layers.{i}.ln1.weight'],
+            'ffn.w1.weight': weights[f'layers.{i}.ffn.w1.weight'],
+            'ffn.w2.weight': weights[f'layers.{i}.ffn.w2.weight'],
+            'ffn.w3.weight': weights[f'layers.{i}.ffn.w3.weight'],
+            'ln2.weight': weights[f'layers.{i}.ln2.weight']
+        }
+        token_embeddings = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=layer_weights,
+            in_features=token_embeddings
+        )
+    token_embeddings = run_rmsnorm(
+        d_model=d_model,
+        eps=1e-5,
+        weights=weights['ln_final.weight'],
+        in_features=token_embeddings
+    )
+    lm_output = run_linear(
+        d_in=d_model,
+        d_out=vocab_size,
+        weights=weights['lm_head.weight'],
+        in_features=token_embeddings
+    )
+    """
+    lm_output = run_softmax(
+        in_features=lm_output,
+        dim=-1
+    )
+    """
+    return lm_output
     raise NotImplementedError
 
 
@@ -481,6 +618,9 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
+    cel = Cross_Entropy_Loss()
+    loss = cel(inputs, targets)
+    return loss
     raise NotImplementedError
 
 
