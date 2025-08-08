@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
 from jaxtyping import Float, Int
@@ -22,6 +23,7 @@ from cs336_basics.model import RoPE
 from cs336_basics.model import Softmax
 from cs336_basics.model import Scaled_Dot_Product_Attention
 from cs336_basics.model import Cross_Entropy_Loss
+from cs336_basics.model import AdamW
 
 
 
@@ -582,6 +584,19 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
+    starts = np.random.randint(
+        low=0,
+        high=len(dataset)-context_length,
+        size=(batch_size,)
+    )
+    inputs = np.stack([dataset[start:start+context_length] for start in starts])
+    labels = np.stack([dataset[start+1:start+context_length+1] for start in starts])
+
+    return (
+        torch.from_numpy(inputs).long().to(device),
+        torch.from_numpy(labels).long().to(device)
+    )
+
     raise NotImplementedError
 
 
@@ -633,13 +648,26 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    parameters_with_grad = [p for p in parameters if p.grad is not None]
+
+    if len(parameters_with_grad) == 0:
+        return
+    
+    total_norm = torch.sqrt(sum(torch.sum(p.grad.pow(2))for p in parameters_with_grad))
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+
+    if clip_coef < 1.0:
+        for p in parameters_with_grad:
+            p.grad.mul_(clip_coef)
+
+    # raise NotImplementedError
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
+    return AdamW
     raise NotImplementedError
 
 
@@ -668,6 +696,13 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
+    if it < warmup_iters:
+        return (it/warmup_iters) * max_learning_rate
+    if it >= warmup_iters and it <= cosine_cycle_iters:
+        T = (it - warmup_iters)/(cosine_cycle_iters - warmup_iters) * np.pi
+        return min_learning_rate + (1 + np.cos(T)) * (max_learning_rate - min_learning_rate)/2
+    if it > cosine_cycle_iters:
+        return min_learning_rate
     raise NotImplementedError
 
 
@@ -687,7 +722,18 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        "iteration": iteration
+    }
+    
+    if isinstance(out, (str, os.PathLike)):
+        with open(out, 'wb') as f:
+            torch.save(checkpoint, f)
+    else:
+        torch.save(checkpoint, out)
+    # raise NotImplementedError
 
 
 def run_load_checkpoint(
@@ -708,6 +754,16 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
+    if isinstance(src, (str, os.PathLike)):
+        with open(src, 'rb') as f:
+            checkpoint = torch.load(f)
+    else:
+        checkpoint = torch.load(src)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    return checkpoint['iteration']
     raise NotImplementedError
 
 

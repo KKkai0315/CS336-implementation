@@ -262,6 +262,292 @@ class Cross_Entropy_Loss(torch.nn.Module):
         target_log_probs = log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)  # (batch_size)
         loss = -target_log_probs.mean()
         return loss
+    
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0:
+            raise ValueError(f"Invalid eps: {eps}")
+        if weight_decay < 0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if betas[0] < 0:
+            raise ValueError(f"Invalid beta index 0: {betas[0]}")
+        if betas[1] < 0:
+            raise ValueError(f"Invalid beta index 1: {betas[1]}")
+        
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(AdamW, self).__init__(params,defaults)
 
+    def step(self, closure = None):
+        loss = None
+        if closure is not None:
+            loss = closure
         
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                # Perform stepweight decay
+                p.data.mul_(1 - group['lr'] * group['weight_decay'])
+
+                    # Get parameter-specific state
+                state = self.state[p]
+
+                    # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                step_size = group['lr']
+                eps = group['eps']
+
+                # Update state
+                state['step'] += 1
+                grad = p.grad.data
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                denom = exp_avg_sq.sqrt().add_(eps)
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = step_size * (bias_correction2 ** 0.5) / bias_correction1
+
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+        return loss
+                
+class TransformerBlock(torch.nn.Module):
+    """
+    A single Transformer block/layer.
+    """
+    def __init__(self, 
+                 d_model: int, 
+                 num_heads: int, 
+                 d_ff: int,
+                 theta: float = 10000.0,
+                 seq_len: int = 512,
+                 device: torch.device | None = None, 
+                 dtype: torch.dtype | None = None):
+        super().__init__()
+        self.attn = MultiHeadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            theta=theta,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype
+        )
+        self.ffn = SWiGLU(d_model=d_model, d_ff=d_ff)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+
+    def forward(self, x: Float[Tensor, "... seq_len d_model"]) -> Float[Tensor, "... seq_len d_model"]:
+        # Pre-norm architecture
+        # Apply attention with residual connection
+        x_attn = self.attn(self.ln1(x))
+        attn_output = x + x_attn
         
+        # Apply FFN with residual connection
+        x_ffn = self.ffn(self.ln2(attn_output))
+        ffn_output = attn_output + x_ffn
+        
+        return ffn_output
+
+
+class BasicsTransformerLM(torch.nn.Module):
+    """
+    A basic Transformer language model implementation.
+    """
+    def __init__(self,
+                 vocab_size: int,
+                 context_length: int,
+                 d_model: int,
+                 num_layers: int,
+                 num_heads: int,
+                 d_ff: int,
+                 rope_theta: float = 10000.0,
+                 device: torch.device | None = None,
+                 dtype: torch.dtype | None = None):
+        super().__init__()
+        
+        # Store configuration
+        self.config = {
+            k: v for k, v in locals().items() 
+            if k != "self" and not (k.startswith("__") and k.endswith("__"))
+        }
+        
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        
+        # Token embeddings
+        self.token_embeddings = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Transformer layers
+        self.layers = torch.nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                theta=rope_theta,
+                seq_len=context_length,
+                device=device,
+                dtype=dtype
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # Final layer norm
+        self.ln_final = RMSNorm(d_model)
+        
+        # Language modeling head
+        self.lm_head = Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+            device=device,
+            dtype=dtype
+        )
+
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the token embedding parameters are excluded.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.token_embeddings.weight.numel()
+        return n_params
+
+    def forward(self, 
+                x: Int[Tensor, "... sequence_length"]) -> Float[Tensor, "... sequence_length vocab_size"]:
+        """
+        Forward pass of the transformer language model.
+        
+        Args:
+            x: Input token IDs of shape (batch_size, sequence_length)
+            
+        Returns:
+            Logits of shape (batch_size, sequence_length, vocab_size)
+        """
+        # Get token embeddings
+        x = self.token_embeddings(x)  # (batch_size, seq_len, d_model)
+        
+        # Pass through transformer layers
+        for layer in self.layers:
+            x = layer(x)  # (batch_size, seq_len, d_model)
+        
+        # Final layer norm
+        x = self.ln_final(x)  # (batch_size, seq_len, d_model)
+        
+        # Language modeling head
+        logits = self.lm_head(x)  # (batch_size, seq_len, vocab_size)
+        
+        return logits
+
+    @torch.no_grad()
+    def generate(self,
+                 x: Int[Tensor, "... sequence_length"],
+                 max_new_tokens: int,
+                 temperature: float = 1.0,
+                 top_k: int | None = None,
+                 eos_token_id: int | None = None) -> Int[Tensor, "... max_new_tokens"]:
+        """
+        Generate tokens autoregressively.
+        
+        Args:
+            x: Input token IDs to condition on
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature
+            top_k: If provided, only sample from top-k tokens
+            eos_token_id: If provided, stop generation when this token is generated
+            
+        Returns:
+            Generated token IDs
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+            
+        original_length = x.size(-1)
+        
+        for _ in range(max_new_tokens):
+            # Truncate to context length if needed
+            x_cond = x[:, -self.context_length:] if x.size(1) > self.context_length else x
+            
+            # Get logits
+            logits = self.forward(x_cond)  # (batch_size, seq_len, vocab_size)
+            
+            # Get logits for next token
+            next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
+            
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply top-k filtering if specified
+            if top_k is not None:
+                v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+                next_token_logits[next_token_logits < v[:, [-1]]] = float('-inf')
+            
+            # Apply softmax
+            softmax = Softmax(dim=-1)
+            probs = softmax(next_token_logits)
+            
+            # Sample next token
+            next_token = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
+            
+            # Check for EOS token
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+                
+            # Append to sequence
+            x = torch.cat([x, next_token], dim=1)
+        
+        # Return only the newly generated tokens
+        return x[:, original_length:]
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path: str):
+        """
+        Load a pretrained model from a directory.
+        
+        Args:
+            pretrained_model_path: Path to the directory containing model files
+            
+        Returns:
+            Loaded BasicsTransformerLM model
+        """
+        import json
+        import os
+        
+        # Load config
+        config_path = os.path.join(pretrained_model_path, "model_config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Create model
+        model = cls(**config)
+        
+        # Load weights
+        weights_path = os.path.join(pretrained_model_path, "model.pt")
+        state_dict = torch.load(weights_path, map_location='cpu')
+        
+        # Remove _orig_mod. prefix if present (from compiled models)
+        unwanted_prefix = "_orig_mod."
+        for k in list(state_dict.keys()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        
+        model.load_state_dict(state_dict)
+        return model
